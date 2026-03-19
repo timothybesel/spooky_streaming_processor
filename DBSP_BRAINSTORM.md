@@ -275,3 +275,541 @@ Most flexible; enables path queries, variable-depth traversals (`->knows*..5->`)
 - Phase 1.2 (multi-level join support in `build_graph` — removes the single-Scan constraint)
 - Phase 2.1 (PhysicalPlan layer — `GraphHop` physical node)
 - Record IDs in `Value` (e.g., `Value::Thing(table, id)`)
+
+---
+
+## 7. ZSet Key Design for a KV-backed Engine
+
+### The Question
+
+When a key-value store (e.g. SurrealDB, RocksDB) holds records like:
+
+```
+user:sdf8sd9f8 => { name: "timothy", age: 28 }
+```
+
+…what should the **ZSet element** (the K in `Z[K] : K → ℤ`) be when the KV store
+emits a change event?
+
+Three options were proposed and evaluated against DBSP algebra, join correctness,
+filter pushdown, and cache performance.
+
+---
+
+### Option A — Record ID as ZSet element
+
+```
+ZSet entry: (Value::Str("user:sdf8sd9f8"), +1)
+```
+
+The event carries only the record identifier. Field values are not in the ZSet element.
+
+**DBSP correctness: ❌ Fatally wrong.**
+
+The ZSet element must uniquely identify a distinct relational tuple including its field
+values. An ID alone does not. Two records `{id:"X", age:28}` and `{id:"X", age:29}`
+are **different tuples in the relational bag** — they must map to different ZSet elements.
+With Option A, both map to the same element `"X"`.
+
+Consequences:
+- **Update is invisible.** When age changes 28 → 29, the CDC produces two identical
+  ID-only events: `("X", -1)` and `("X", +1)`. `BatchingOp`'s equality check finds a
+  match, increments net weight by -1 then +1 → zero → **pruned**. The update is
+  silently swallowed before it reaches any downstream operator.
+- **Filter breaks.** `FilterOp` calls `record.get("age")` on the incoming event. With
+  Option A the record is `{"id": "user:sdf8sd9f8"}` — no `age` field.
+  `Predicate::Gt("age", ...)` hits `_ => false` and every record is silently discarded.
+- **Join output is empty.** The merged record after a join probe contains only the ID
+  from the left side plus whatever the right side stored (also ID-only). No user-facing
+  columns appear in the output.
+
+**Verdict: Definitively wrong. Do not use.**
+
+---
+
+### Option B — Full record as ZSet element (current approach)
+
+```
+ZSet entry: ({id:"user:sdf8sd9f8", name:"timothy", age:28}, +1)
+```
+
+The full denormalized record is the ZSet element. For `SELECT name, age FROM users`,
+`ProjectOp` trims to:
+
+```
+ZSet entry: ({name:"timothy", age:28}, +1)
+```
+
+**DBSP correctness: ✅ Correct.**
+
+`Z[Record] : Record → ℤ` satisfies every ZSet axiom:
+- Element identity = full tuple → distinct field values = distinct elements.
+- Weights are integers in ℤ; pointwise addition is well-defined.
+- Retraction: CDC emits `(old_record, -1)` then `(new_record, +1)`. Because
+  `old_record ≠ new_record` (they differ in the changed field), they are separate ZSet
+  entries and both propagate downstream independently.
+
+**Join probe:** `event.record.get(join_key_col)` extracts the join column value.
+`merged.extend(other.as_ref().clone())` produces the full combined tuple with all
+columns from both sides. The current `JoinMap = HashMap<Value, Vec<(Arc<Record>, i64)>>`
+is already this design:
+
+```
+outer key: join column value  → fast O(1) index (not the ZSet key)
+inner vec: (Arc<Record>, i64) → the ZSet entries (full record = ZSet key)
+```
+
+The `Arc<Record>` stored in the bucket is the **same heap allocation** as the incoming
+event record (after `Arc::new(event.record)` on join.rs:201). No duplicate copy.
+Refcount clones during Phase 1 probe are pointer increments, not record copies.
+
+**Filter pushdown:** `record.get("age")` hits the in-memory `HashMap` in ~5–15 ns.
+All column values are co-located in the same `HashMap` backing table (~3 cache lines
+for a 5-column record). Filter + join key extraction + projection all touch the same
+hot cache lines — L1-friendly.
+
+**Performance:**
+- ~500 bytes/event for a 5-column record (48-byte HashMap + backing table + heap strings)
+- `JoinMap` overhead: ~56 bytes of Arc/metadata per stored record (record itself shared)
+- At 1M records: ~556 MB total (events transient; JoinMap retains only live records)
+- Update path: `Vec::find()` comparison is O(M × N_cols) where M = records per bucket.
+  For unique join keys (M=1, the common case) this is O(N_cols) ≈ 5 comparisons — fast.
+
+**Projection:** `ProjectOp` places `HashMap::retain` over N columns keeping K.
+At 5 total / 2 retained: ~10 string comparisons + 3 heap drops per event (~80 ns).
+For 1M events: ~80 ms total — acceptable.
+
+**Invariant the design must maintain:**
+> `ProjectOp` must never strip the join-key column before that column reaches
+> `JoinSideOp`. If the optimizer places `Project` before `Join` and projects away
+> the join key, retraction events arrive at `JoinSideOp` with `record.get(join_key) == None`,
+> breaking both probe and retraction. The optimizer must enforce that join-key columns
+> survive until after the join materialises.
+
+**Verdict: The only correct choice for this engine. Already implemented.**
+
+---
+
+### Option C — Per-column inverted ZSets
+
+```
+zset_name: { "timothy" => ["user:sdf8sd9f8"] }
+zset_age:  { 28        => ["user:sdf8sd9f8"] }
+```
+
+Weight derived from `zset_age[28].len()` → "how many records have this value".
+
+**DBSP correctness: ❌ Fatally wrong as a ZSet.**
+
+`len()` is **not** a DBSP weight. DBSP weights are integers in ℤ — they must support
+additive inverses (retractions). `len()` is always `≥ 0`; you cannot represent `len = -1`.
+
+Specific failures:
+- **Retraction algebra broken.** After inserting users A and B both with `age=28`,
+  `zset_age[28].len() = 2`. Deleting user A gives `len = 1`. From a DBSP perspective
+  the delete of A should emit a `(record_A, -1)` event. With Option C, downstream
+  sees only "cardinality of age=28 decreased by 1" — it cannot identify **which** record
+  was retracted, so it cannot retract the corresponding join output.
+- **Tuple identity lost.** The element `28` represents all records with `age=28`, not
+  any specific tuple. Two distinct tuples `{id:X, age:28}` and `{id:Y, age:28}` collide
+  into the same ZSet element.
+- **Join incompatible.** `JoinSideOp` expects `Vec<(Arc<Record>, i64)>` — full records
+  with weights. Reconstructing a full record from per-column ZSets requires N separate
+  HashMap lookups, one per column. For 1M records × 5 columns with ZSet tables of
+  ~72 MB each, this is a cache-cold random-access storm: ~500 ns per reconstructed
+  record vs ~15 ns for Option B.
+- **Filter incompatible.** `FilterOp::on_event` calls `record.get("age")` on the
+  arriving event. Option C events do not carry field values in this form — it requires
+  a completely different execution model (bulk set-intersection, not push-based row filter).
+
+Option C is a legitimate **secondary data structure** (a secondary index or an inverted
+index for accelerating specific predicates) but cannot serve as the primary ZSet
+representation. It may be useful as an optimisation for range-scan predicates on
+high-cardinality columns *after* the correct primary ZSet (Option B) is established.
+
+**Verdict: Not a ZSet. Incompatible with every current operator. Do not use as primary representation.**
+
+---
+
+### Option D — Hybrid (current design, recommended)
+
+```
+JoinMap = HashMap<join_key_value, Vec<(Arc<Record>, i64)>>
+```
+
+- **Outer HashMap key** = join column value (like Option A) → O(1) probe index
+- **Inner Vec entries** = `(Arc<Record>, i64)` = full-record ZSet elements with weights (Option B)
+
+This is exactly what `src/engine/join.rs` already implements. The outer key is a
+**secondary index** for fast probe lookup, not the ZSet identity key. The ZSet identity
+is the full record, preserved via full `HashMap<String, Value>` equality in `find()`.
+
+This design is algebraically correct and cache-efficient:
+- Probe: O(1) outer lookup + O(M) inner scan (M = records per bucket; usually 1)
+- Retraction: `find()` uses full record equality → exact match, exact weight decrement
+- Memory: one heap allocation per live record, shared by `Arc` between the event and
+  the JoinMap entry — no double copy
+
+**Verdict: The correct design. Already implemented.**
+
+---
+
+### CDC Source Requirements
+
+For all correct options (B and D), the KV store CDC layer **must provide the old
+record on delete/update**, not just the record ID:
+
+| CDC event type | Required payload | DBSP delta emitted |
+|----------------|------------------|--------------------|
+| INSERT | `new_record` | `(new_record, +1)` |
+| DELETE | `old_record` (full fields) | `(old_record, -1)` |
+| UPDATE | `old_record` + `new_record` | `(old_record, -1)` then `(new_record, +1)` |
+
+Without the old record at delete/update time, the `-1` event cannot be emitted with the
+correct ZSet element, and the downstream operators cannot retract their previous outputs.
+This is a **source adapter requirement**, not an engine requirement. SurrealDB's
+LIVE SELECT, RocksDB's column family column families, and Postgres logical replication
+(with `REPLICA IDENTITY FULL`) all provide this.
+
+---
+
+### Summary Table
+
+| Option | ZSet algebra correct? | Filter works inline? | Join probe output complete? | CDC update visible? | Verdict |
+|--------|-----------------------|---------------------|----------------------------|---------------------|---------|
+| A — ID only | ❌ ID ≠ tuple identity | ❌ No field values | ❌ Empty merged records | ❌ Identical events cancel | Wrong |
+| B — Full record | ✅ | ✅ ~10 ns/field | ✅ All columns present | ✅ Distinct old/new records | **Correct** |
+| C — Per-column | ❌ `len()` ≠ weight | ❌ Wrong execution model | ❌ Requires N lookups/record | ❌ Identity lost | Wrong |
+| D — B+index (current) | ✅ | ✅ | ✅ | ✅ | **Correct — already implemented** |
+
+---
+
+## 8. WHERE / ORDER BY / LIMIT — Separate Nodes vs Pushed Into Scan
+
+_Generated by dbsp-module-team brainstorm — 4 specialist agents (DBSP math, AST lowering, performance, clean code)_
+
+### The Question
+
+Currently the parser only handles `SELECT fields FROM table` (with subqueries).
+The user wants to add WHERE, ORDER BY, and LIMIT. Three approaches were evaluated:
+
+- **Approach A**: Separate nodes in LogicalPlan (current backup design)
+- **Approach B**: Rich Scan node that absorbs filter/sort/limit
+- **Approach C**: Hybrid — separate in LogicalPlan, folded at PhysicalPlan level
+
+### Verdict: Approach C (Hybrid) — Unanimous across all 4 agents
+
+```
+LogicalPlan:   Limit → Sort → Project → Filter → Scan     (separate, composable)
+PhysicalPlan:  IndexScan(table, range: age>18, limit: 10)  (folded, redb-aware)
+```
+
+---
+
+### 8.1 DBSP Math: Why Sort and Limit CANNOT Live in Scan
+
+**Filter (WHERE)** is a linear DBSP operator: `D[σ_p(R)] = σ_p(D[R])`. Zero state, fully
+incremental. Each incoming `(record, weight)` is tested independently. This is the easiest
+operator — it can live anywhere in the tree.
+
+**Sort (ORDER BY)** is NOT linear: `D[sort(R)] ≠ sort(D[R])`. The correct incremental
+formulation is `sort(R + ΔR) − sort(R)`, which requires materializing the full sorted
+state. Sort must maintain a `BTreeMap` over ALL records (not just the current batch).
+It cannot be a simple iterator decorator on redb in the streaming case.
+
+**Limit** is the MOST non-incremental operator. Example:
+
+```
+State: {alice, bob, charlie}  →  LIMIT 3 output: {alice, bob, charlie}
+
+Insert "aaron":
+  Output becomes: {aaron, alice, bob}
+  Delta: (aaron, +1), (charlie, -1)  ← charlie was EVICTED
+
+Delete "alice":
+  Output becomes: {aaron, bob, charlie}
+  Delta: (alice, -1), (charlie, +1)  ← charlie RE-ENTERS
+```
+
+A single insertion can cause a retraction of an unrelated record. A deletion can
+cause an insertion. The Sort+Limit operator must maintain ALL records ever seen
+(not just top-N) because evicted records may return:
+
+```rust
+pub struct SortLimitOp {
+    all_records: BTreeMap<SortKey, (Record, Weight)>,  // O(total records) memory
+    current_output: BTreeSet<(SortKey, Record)>,       // current top-N
+    limit: usize,
+}
+```
+
+**Consequence**: Embedding Sort+Limit into Scan is semantically wrong for streaming.
+The Scan receives CDC events one at a time — it cannot maintain the global sorted state
+needed for correct Limit behavior. Sort+Limit must be separate stateful operators.
+
+**Exception**: For one-shot batch queries (not streaming), redb's B-tree order
+CAN be exploited: `table.range(19..).take(10)` is O(10), not O(N). But this is a
+physical optimization, not a logical one.
+
+---
+
+### 8.2 The Three Layers
+
+| Layer | Responsibility | WHERE | ORDER BY | LIMIT |
+|-------|---------------|-------|----------|-------|
+| **LogicalPlan** | Algebraic intent | `Filter` node | `Sort` node | `Limit` node |
+| **PhysicalPlan** | Algorithm selection + redb awareness | `IndexScan.range` or `Filter` | Eliminated if matches key, else `Sort` | Folded into `Sort` or `IndexScan.scan_limit` |
+| **Operator DAG** | Push-based execution | `FilterOp` (stateless) | `SortLimitOp` (BTreeMap state) | Part of `SortLimitOp` |
+
+**LogicalPlan stays separate** — this is what the optimizer works on. Predicate pushdown,
+projection pushdown, filter splitting all require separate nodes.
+
+**PhysicalPlan folds** — `select_physical_plan` has access to `TableSchema` (which column
+is the redb key). It makes storage-aware decisions:
+
+```
+Filter(age > 18, Scan("user"))  →  IndexScan("user", range: age > 18)     // key predicate
+Filter(name = "x", Scan("user"))  →  Filter(name="x", IndexScan("user"))  // non-key, stays
+Sort(age ASC, IndexScan)  →  eliminated (matches redb key order)
+Sort(name ASC, IndexScan)  →  Sort(name ASC, IndexScan)  (does NOT match key)
+Limit(10, IndexScan)  →  IndexScan(scan_limit: 10)  (only if Sort was eliminated)
+Limit(10, Sort(...))  →  Sort(limit: Some(10))  (fused as today)
+```
+
+---
+
+### 8.3 Concrete Types for the Parser AST
+
+Extend `SelectStatement` in `src/parser/types.rs`:
+
+```rust
+#[derive(Debug, Clone)]
+pub struct SelectStatement {
+    pub fields:     Vec<Field>,
+    pub table:      String,
+    pub where_:     Option<WhereExpr>,     // NEW
+    pub order_by:   Vec<OrderByKey>,       // NEW (empty = no ORDER BY)
+    pub limit:      Option<u64>,           // NEW
+    pub start:      Option<u64>,           // NEW (SurrealQL's OFFSET)
+}
+
+// ─── WHERE clause ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum WhereExpr {
+    BinaryOp { op: WhereOp, left: Box<WhereOperand>, right: Box<WhereOperand> },
+    And(Box<WhereExpr>, Box<WhereExpr>),
+    Or(Box<WhereExpr>, Box<WhereExpr>),
+    Not(Box<WhereExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhereOp { Eq, Ne, Gt, Ge, Lt, Le, In }
+
+#[derive(Debug, Clone)]
+pub enum WhereOperand {
+    Column(String),
+    LiteralInt(i64),
+    LiteralFloat(f64),
+    LiteralStr(String),
+    LiteralBool(bool),
+    LiteralNull,
+    Subquery(Box<SelectStatement>),
+}
+
+// ─── ORDER BY ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct OrderByKey {
+    pub column: String,
+    pub direction: SortDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortDir { Asc, Desc }
+```
+
+**Why separate from `Predicate`?** `WhereExpr` can hold `Subquery(Box<SelectStatement>)` —
+needed for `col IN (SELECT ...)` decorrelation. `Predicate` (in plan.rs) is post-decorrelation
+and has no subquery variant. The subquery must survive into `lower_select` so decorrelation
+can fire.
+
+**Why `f64` not `OrderedFloat`?** The parser has no need for `Hash + Eq` on floats. The
+lowering step wraps it: `LiteralFloat(f) → Value::Float(OrderedFloat(f))`.
+
+**`SortDir`**: Can be shared with `plan::SortDir` to avoid duplication. It's a pure semantic
+value with no syntax-specific content.
+
+---
+
+### 8.4 Lowering: Node Stacking Order
+
+`lower_select` produces this plan tree (innermost to outermost):
+
+```
+Limit { count: 10, offset: 5 }
+  └── Sort { keys: [("name", Asc)] }
+        └── Project { columns: ["name", "age"] }
+              └── Filter { predicate: Eq("active", Bool(true)) }
+                    └── Filter { predicate: Gt("age", Int(18)) }
+                          └── Scan { table: "user" }
+```
+
+For `SELECT name, age FROM user WHERE age > 18 AND active = true ORDER BY name ASC LIMIT 10 START 5`.
+
+The order matches SQL semantics:
+1. **Scan** — raw source
+2. **Filter(s)** — WHERE predicates (AND produces stacked Filters)
+3. **Project** — SELECT list column reduction
+4. **Sort** — ORDER BY (needs projected columns to still include sort keys)
+5. **Limit** — LIMIT/START always outermost
+
+```rust
+pub fn lower_select(stmt: SelectStmt) -> Result<LogicalPlan, LoweringError> {
+    let mut plan = LogicalPlan::Scan { table: stmt.table };
+
+    // WHERE → Filter / Join (decorrelation for IN subqueries)
+    if let Some(cond) = stmt.where_clause {
+        plan = lower_cond(cond, plan)?;
+    }
+
+    // SELECT fields → Project
+    if !stmt.select_fields.is_empty() {
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            columns: stmt.select_fields,
+        };
+    }
+
+    // ORDER BY → Sort
+    if !stmt.order_by.is_empty() {
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys: stmt.order_by.into_iter()
+                .map(|k| (k.column, k.dir))
+                .collect(),
+        };
+    }
+
+    // LIMIT / START → Limit
+    if stmt.limit.is_some() || stmt.start.is_some() {
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            count: stmt.limit.unwrap_or(usize::MAX as u64) as usize,
+            offset: stmt.start.unwrap_or(0) as usize,
+        };
+    }
+
+    Ok(plan)
+}
+```
+
+---
+
+### 8.5 PhysicalPlan: IndexScan with redb Awareness
+
+```rust
+pub struct ScanParams {
+    pub table: String,
+    /// Key range extracted from a Filter predicate on the redb key column.
+    /// None = full table scan.
+    pub range: Option<KeyRange>,
+    /// Limit pushed into the redb iterator: `.take(n)`.
+    /// Only valid when the scan order matches ORDER BY (Sort was eliminated).
+    pub scan_limit: Option<usize>,
+    /// What ordering the scan output provides.
+    pub order: OrderGuarantee,
+}
+
+pub struct KeyRange {
+    pub col: String,
+    pub lo: Option<(Value, bool)>,  // (bound, inclusive)
+    pub hi: Option<(Value, bool)>,
+}
+
+pub enum OrderGuarantee {
+    None,
+    Sorted(Vec<(String, SortDir)>),
+}
+
+pub enum PhysicalPlan {
+    IndexScan(ScanParams),           // replaces Source
+    Filter { input: Box<PhysicalPlan>, predicate: Predicate },  // residual only
+    Project { input: Box<PhysicalPlan>, columns: Vec<String> },
+    SymmetricHashJoin { /* ... */ },
+    Sort { input: Box<PhysicalPlan>, keys: Vec<(String, SortDir)>, limit: Option<usize> },
+    // ...
+}
+```
+
+**The combined optimization trace** for
+`SELECT name FROM user WHERE age > 18 ORDER BY age LIMIT 10` (age = redb key):
+
+```
+Step 1 — Scan("user")
+  → IndexScan(range: None, order: Sorted([("age", Asc)]))
+
+Step 2 — Filter(age > 18)
+  → predicate_to_range(Gt("age", 18), key_col="age") → range consumed, no residual
+  → IndexScan(range: age > 18, order: Sorted([("age", Asc)]))
+
+Step 3 — Sort(age ASC)
+  → scan_order_satisfies([("age",Asc)], [("age",Asc)]) → true
+  → Sort ELIMINATED. IndexScan passes through.
+
+Step 4 — Limit(10)
+  → input is bare IndexScan → set scan_limit = 10
+  → IndexScan(range: age > 18, scan_limit: 10, order: Sorted)
+
+Runtime: table.range(Excluded(18)..).take(10)  — reads exactly 10 B-tree entries
+```
+
+vs naive: scan all 1M rows, filter 820K, sort remaining 180K, take 10. **~10,000x faster**.
+
+---
+
+### 8.6 When redb Optimization Does NOT Apply (Streaming Case)
+
+For continuously maintained views via CDC events, the redb B-tree optimization only helps
+with the **initial snapshot population**. Incremental maintenance always requires:
+
+- `FilterOp`: stateless, zero overhead — works identically for batch and streaming
+- `SortLimitOp`: stateful BTreeMap over ALL records — cannot be replaced by redb iteration
+  because CDC events arrive one at a time, not as a sorted batch
+
+The practical architecture:
+
+```
+Batch query (one-shot):   IndexScan(range, limit)  →  redb does the work
+Streaming view (CDC):     FilterOp + SortLimitOp    →  in-memory state does the work
+```
+
+Both paths share the same LogicalPlan. The `select_physical_plan` function chooses
+between them based on whether the query is a one-shot scan or a maintained view.
+
+---
+
+### 8.7 Performance Impact by Data Size
+
+| N (rows) | Naive (scan+sort+limit) | Optimized (range+take) | Speedup |
+|-----------|------------------------|----------------------|---------|
+| 100 | ~5 µs | ~1 µs | 5x |
+| 10,000 | ~2 ms | ~50 µs | 40x |
+| 1,000,000 | ~800 ms | ~80 µs | 10,000x |
+| 100,000,000 | OOM | ~80 µs | ∞ |
+
+The crossover where this matters: **~50,000 rows**. Below that, full scan is fine.
+
+---
+
+### 8.8 Decision Summary
+
+| Question | Answer |
+|----------|--------|
+| Separate nodes or push into Scan? | **Separate in LogicalPlan, fold in PhysicalPlan** |
+| Where does redb awareness live? | **`select_physical_plan`** (not optimizer, not runtime) |
+| Can Filter be pushed into redb? | **Yes** — key predicates become `table.range()` |
+| Can Sort be eliminated? | **Yes** — when ORDER BY matches redb key order |
+| Can Limit be pushed into redb? | **Yes** — but ONLY when Sort was already eliminated |
+| What about streaming/CDC? | Sort+Limit always need in-memory `SortLimitOp` state |
+| Parser AST types — shared or separate? | **Separate** `WhereExpr`/`WhereOp`/`WhereOperand` (subquery support) |

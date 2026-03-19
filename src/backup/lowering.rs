@@ -1,8 +1,8 @@
-//! # Lowering: Mock SurrealDB AST → Logical Plan
+//! # Lowering: SurrealQL SELECT AST → Logical Plan
 //!
 //! This module translates a simplified SurrealDB-style SELECT AST into a
-//! `LogicalPlan`.  The mock AST types (`MockSelectStmt`, `MockCond`, etc.)
-//! mirror the real `surrealdb_core` AST but are simpler to construct in tests.
+//! `LogicalPlan`.  The AST types (`SelectStmt`, `SelectCond`, etc.)
+//! mirror the real `surrealdb_core` AST structure but are owned by this crate.
 //!
 //! ## The decorrelation trick
 //!
@@ -50,40 +50,38 @@ pub enum LoweringError {
     EmptyFrom,
 }
 
-// ─── Mock SurrealDB AST types ─────────────────────────────────────────────────
-//
-// These types are kept `pub(crate)` — they are test helpers, not the public
-// API boundary.  Production code uses the real `surrealdb_core::sql` types
-// via `real_lowering::lower_real_select`.
+// ─── SurrealQL SELECT AST types ──────────────────────────────────────────────
 
-/// Simplified mock of a SurrealDB `SELECT` statement.
-pub(crate) struct MockSelectStmt {
+/// A parsed SurrealQL `SELECT` statement.
+///
+/// Produced by `parser::parse_select` and consumed by `lower_select`.
+pub struct SelectStmt {
     /// `FROM` target — the outer table name.
-    pub(crate) table: String,
+    pub table: String,
     /// Columns named in the `SELECT` list (empty = `SELECT *`).
-    pub(crate) select_fields: Vec<String>,
+    pub select_fields: Vec<String>,
     /// Optional `WHERE` clause.
-    pub(crate) cond: Option<MockCond>,
+    pub cond: Option<SelectCond>,
 }
 
 /// A condition node in the `WHERE` clause (may be nested).
-pub(crate) enum MockCond {
+pub enum SelectCond {
     BinaryOp {
-        op: MockOp,
-        left: MockExpr,
-        right: MockExpr,
+        op: SelectOp,
+        left: SelectExpr,
+        right: SelectExpr,
     },
     /// Logical AND of two sub-conditions.
-    And(Box<MockCond>, Box<MockCond>),
+    And(Box<SelectCond>, Box<SelectCond>),
     /// Logical OR of two sub-conditions.
-    Or(Box<MockCond>, Box<MockCond>),
+    Or(Box<SelectCond>, Box<SelectCond>),
     /// Logical NOT of a sub-condition.
-    Not(Box<MockCond>),
+    Not(Box<SelectCond>),
 }
 
 /// Operators in a `WHERE` binary expression.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum MockOp {
+pub enum SelectOp {
     /// `col IN (...)` / `col INSIDE (...)` — triggers decorrelation.
     Inside,
     Gt,
@@ -98,20 +96,20 @@ pub(crate) enum MockOp {
 }
 
 /// An expression on either side of a binary operator.
-pub(crate) enum MockExpr {
+pub enum SelectExpr {
     Column(String),
     Literal(Value),
     /// A full nested SELECT — becomes the right-hand side of a Semi-Join.
-    Subquery(Box<MockSelectStmt>),
+    Subquery(Box<SelectStmt>),
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/// Lower a mock `SELECT` statement to a `LogicalPlan`.
+/// Lower a `SelectStmt` to a `LogicalPlan`.
 ///
 /// Returns `Err(LoweringError)` for any condition that cannot be represented
 /// in the current `LogicalPlan` IR.  No silent fallbacks.
-pub fn lower_select(stmt: MockSelectStmt) -> Result<LogicalPlan, LoweringError> {
+pub fn lower_select(stmt: SelectStmt) -> Result<LogicalPlan, LoweringError> {
     if stmt.table.is_empty() {
         return Err(LoweringError::EmptyFrom);
     }
@@ -139,19 +137,19 @@ pub fn lower_select(stmt: MockSelectStmt) -> Result<LogicalPlan, LoweringError> 
 
 // ─── Condition lowering ───────────────────────────────────────────────────────
 
-/// Lower a `MockCond` onto a base plan, returning the new plan.
+/// Lower a `SelectCond` onto a base plan, returning the new plan.
 ///
 /// * `AND` conditions stack as nested `Filter` nodes.
 /// * `OR` conditions produce a `Filter { predicate: Or(...) }`.
 /// * `Inside(col, subquery)` decorrelates to a `Join { kind: LeftSemi }`.
 /// * Any unrecognised shape returns `Err(LoweringError::UnsupportedCondition)`.
-fn lower_cond(cond: MockCond, base: LogicalPlan) -> Result<LogicalPlan, LoweringError> {
+fn lower_cond(cond: SelectCond, base: LogicalPlan) -> Result<LogicalPlan, LoweringError> {
     match cond {
         // ── Decorrelation: col IN (subquery) → Semi-Join ─────────────────
-        MockCond::BinaryOp {
-            op: MockOp::Inside,
-            left: MockExpr::Column(outer_col),
-            right: MockExpr::Subquery(sub_stmt),
+        SelectCond::BinaryOp {
+            op: SelectOp::Inside,
+            left: SelectExpr::Column(outer_col),
+            right: SelectExpr::Subquery(sub_stmt),
         } => {
             let inner_col = sub_stmt
                 .select_fields
@@ -172,17 +170,17 @@ fn lower_cond(cond: MockCond, base: LogicalPlan) -> Result<LogicalPlan, Lowering
         }
 
         // ── C5 fix: Inside with a scalar is semantically invalid ──────────
-        MockCond::BinaryOp {
-            op: MockOp::Inside,
-            left: MockExpr::Column(col),
-            right: MockExpr::Literal(_),
+        SelectCond::BinaryOp {
+            op: SelectOp::Inside,
+            left: SelectExpr::Column(col),
+            right: SelectExpr::Literal(_),
         } => Err(LoweringError::InsideRequiresSubquery { col }),
 
         // ── Normal scalar predicate → Filter ─────────────────────────────
-        MockCond::BinaryOp {
+        SelectCond::BinaryOp {
             op,
-            left: MockExpr::Column(col),
-            right: MockExpr::Literal(val),
+            left: SelectExpr::Column(col),
+            right: SelectExpr::Literal(val),
         } => {
             let predicate = lower_op(op, col, val)?;
             Ok(LogicalPlan::Filter {
@@ -192,13 +190,13 @@ fn lower_cond(cond: MockCond, base: LogicalPlan) -> Result<LogicalPlan, Lowering
         }
 
         // ── Logical AND: stack two filters ────────────────────────────────
-        MockCond::And(left_cond, right_cond) => {
+        SelectCond::And(left_cond, right_cond) => {
             let plan = lower_cond(*left_cond, base)?;
             lower_cond(*right_cond, plan)
         }
 
         // ── Logical OR: produce a compound predicate ──────────────────────
-        MockCond::Or(left_cond, right_cond) => {
+        SelectCond::Or(left_cond, right_cond) => {
             let left_pred = extract_simple_predicate(*left_cond)?;
             let right_pred = extract_simple_predicate(*right_cond)?;
             Ok(LogicalPlan::Filter {
@@ -208,7 +206,7 @@ fn lower_cond(cond: MockCond, base: LogicalPlan) -> Result<LogicalPlan, Lowering
         }
 
         // ── Logical NOT ───────────────────────────────────────────────────
-        MockCond::Not(inner) => {
+        SelectCond::Not(inner) => {
             let pred = extract_simple_predicate(*inner)?;
             Ok(LogicalPlan::Filter {
                 input: Box::new(base),
@@ -224,41 +222,41 @@ fn lower_cond(cond: MockCond, base: LogicalPlan) -> Result<LogicalPlan, Lowering
 }
 
 /// Lower a binary operator + column + literal to a `Predicate`.
-fn lower_op(op: MockOp, col: String, val: Value) -> Result<Predicate, LoweringError> {
+fn lower_op(op: SelectOp, col: String, val: Value) -> Result<Predicate, LoweringError> {
     match op {
-        MockOp::Gt => Ok(Predicate::Gt(col, val)),
-        MockOp::Lt => Ok(Predicate::Lt(col, val)),
-        MockOp::Eq => Ok(Predicate::Eq(col, val)),
-        MockOp::Ne => Ok(Predicate::Ne(col, val)),
-        MockOp::Ge => Ok(Predicate::Ge(col, val)),
-        MockOp::Le => Ok(Predicate::Le(col, val)),
-        MockOp::Inside => Err(LoweringError::InsideRequiresSubquery { col }),
+        SelectOp::Gt => Ok(Predicate::Gt(col, val)),
+        SelectOp::Lt => Ok(Predicate::Lt(col, val)),
+        SelectOp::Eq => Ok(Predicate::Eq(col, val)),
+        SelectOp::Ne => Ok(Predicate::Ne(col, val)),
+        SelectOp::Ge => Ok(Predicate::Ge(col, val)),
+        SelectOp::Le => Ok(Predicate::Le(col, val)),
+        SelectOp::Inside => Err(LoweringError::InsideRequiresSubquery { col }),
     }
 }
 
 /// Extract a simple `Predicate` from a condition that cannot contain joins.
 /// Used for the operands of OR/NOT, which cannot decorrelate subqueries.
-fn extract_simple_predicate(cond: MockCond) -> Result<Predicate, LoweringError> {
+fn extract_simple_predicate(cond: SelectCond) -> Result<Predicate, LoweringError> {
     match cond {
-        MockCond::BinaryOp {
+        SelectCond::BinaryOp {
             op,
-            left: MockExpr::Column(col),
-            right: MockExpr::Literal(val),
+            left: SelectExpr::Column(col),
+            right: SelectExpr::Literal(val),
         } => lower_op(op, col, val),
 
-        MockCond::And(l, r) => {
+        SelectCond::And(l, r) => {
             let lp = extract_simple_predicate(*l)?;
             let rp = extract_simple_predicate(*r)?;
             Ok(Predicate::And(Box::new(lp), Box::new(rp)))
         }
 
-        MockCond::Or(l, r) => {
+        SelectCond::Or(l, r) => {
             let lp = extract_simple_predicate(*l)?;
             let rp = extract_simple_predicate(*r)?;
             Ok(Predicate::Or(Box::new(lp), Box::new(rp)))
         }
 
-        MockCond::Not(inner) => {
+        SelectCond::Not(inner) => {
             let p = extract_simple_predicate(*inner)?;
             Ok(Predicate::Not(Box::new(p)))
         }
@@ -270,23 +268,23 @@ fn extract_simple_predicate(cond: MockCond) -> Result<Predicate, LoweringError> 
 }
 
 /// Human-readable description of a condition — used in error messages.
-fn describe_cond(cond: &MockCond) -> String {
+fn describe_cond(cond: &SelectCond) -> String {
     match cond {
-        MockCond::BinaryOp { op, left, right } => {
+        SelectCond::BinaryOp { op, left, right } => {
             let l = match left {
-                MockExpr::Column(c) => c.clone(),
-                MockExpr::Literal(v) => format!("{v:?}"),
-                MockExpr::Subquery(_) => "(subquery)".into(),
+                SelectExpr::Column(c) => c.clone(),
+                SelectExpr::Literal(v) => format!("{v:?}"),
+                SelectExpr::Subquery(_) => "(subquery)".into(),
             };
             let r = match right {
-                MockExpr::Column(c) => c.clone(),
-                MockExpr::Literal(v) => format!("{v:?}"),
-                MockExpr::Subquery(_) => "(subquery)".into(),
+                SelectExpr::Column(c) => c.clone(),
+                SelectExpr::Literal(v) => format!("{v:?}"),
+                SelectExpr::Subquery(_) => "(subquery)".into(),
             };
             format!("{l} {:?} {r}", op)
         }
-        MockCond::And(_, _) => "AND".into(),
-        MockCond::Or(_, _) => "OR".into(),
-        MockCond::Not(_) => "NOT".into(),
+        SelectCond::And(_, _) => "AND".into(),
+        SelectCond::Or(_, _) => "OR".into(),
+        SelectCond::Not(_) => "NOT".into(),
     }
 }
