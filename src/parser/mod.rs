@@ -310,10 +310,9 @@ pub fn parse_where_expr(input: &mut &str) -> ModalResult<WhereExpr> {
 /// `or_expr := and_expr ( (OR | ||) and_expr )*`
 fn parse_or_expr(input: &mut &str) -> ModalResult<WhereExpr> {
     let first = parse_and_expr(input)?;
-    let mut result = first;
+    let mut items = vec![first];
     loop {
         let checkpoint = *input;
-        // Try OR keyword
         let found_or = kw("OR", input).is_ok() || {
             *input = checkpoint;
             let _ = multispace0.parse_next(input)?;
@@ -328,19 +327,21 @@ fn parse_or_expr(input: &mut &str) -> ModalResult<WhereExpr> {
         if !found_or {
             break;
         }
-        let right = parse_and_expr(input)?;
-        result = WhereExpr::Or(Box::new(result), Box::new(right));
+        items.push(parse_and_expr(input)?);
     }
-    Ok(result)
+    if items.len() == 1 {
+        Ok(items.pop().unwrap())
+    } else {
+        Ok(WhereExpr::Or(items))
+    }
 }
 
 /// `and_expr := not_expr ( (AND | &&) not_expr )*`
 fn parse_and_expr(input: &mut &str) -> ModalResult<WhereExpr> {
     let first = parse_not_expr(input)?;
-    let mut result = first;
+    let mut items = vec![first];
     loop {
         let checkpoint = *input;
-        // Try AND keyword
         let found_and = kw("AND", input).is_ok() || {
             *input = checkpoint;
             let _ = multispace0.parse_next(input)?;
@@ -355,10 +356,13 @@ fn parse_and_expr(input: &mut &str) -> ModalResult<WhereExpr> {
         if !found_and {
             break;
         }
-        let right = parse_not_expr(input)?;
-        result = WhereExpr::And(Box::new(result), Box::new(right));
+        items.push(parse_not_expr(input)?);
     }
-    Ok(result)
+    if items.len() == 1 {
+        Ok(items.pop().unwrap())
+    } else {
+        Ok(WhereExpr::And(items))
+    }
 }
 
 /// `not_expr := NOT not_expr | !not_expr | atom_cond`
@@ -710,23 +714,12 @@ mod tests {
     fn where_ge_le() {
         let stmt = parse_ok("SELECT * FROM user WHERE age >= 18 AND age <= 65");
         match stmt.where_.unwrap() {
-            WhereExpr::And(left, right) => {
-                assert!(matches!(
-                    *left,
-                    WhereExpr::BinaryOp {
-                        op: WhereOp::Ge,
-                        ..
-                    }
-                ));
-                assert!(matches!(
-                    *right,
-                    WhereExpr::BinaryOp {
-                        op: WhereOp::Le,
-                        ..
-                    }
-                ));
+            WhereExpr::And(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], WhereExpr::BinaryOp { op: WhereOp::Ge, .. }));
+                assert!(matches!(items[1], WhereExpr::BinaryOp { op: WhereOp::Le, .. }));
             }
-            other => panic!("expected And(Ge, Le), got {other:?}"),
+            other => panic!("expected And([Ge, Le]), got {other:?}"),
         }
     }
 
@@ -735,25 +728,26 @@ mod tests {
     #[test]
     fn where_and() {
         let stmt = parse_ok("SELECT * FROM user WHERE age > 18 AND active = true");
-        assert!(matches!(stmt.where_.unwrap(), WhereExpr::And(_, _)));
+        assert!(matches!(stmt.where_.unwrap(), WhereExpr::And(_)));
     }
 
     #[test]
     fn where_or() {
         let stmt = parse_ok("SELECT * FROM user WHERE age < 18 OR age > 65");
-        assert!(matches!(stmt.where_.unwrap(), WhereExpr::Or(_, _)));
+        assert!(matches!(stmt.where_.unwrap(), WhereExpr::Or(_)));
     }
 
     #[test]
     fn where_and_or_precedence() {
-        // AND binds tighter: `a OR b AND c` → `Or(a, And(b, c))`
+        // AND binds tighter: `a OR b AND c` → `Or([a, And([b, c])])`
         let stmt = parse_ok("SELECT * FROM user WHERE x = 1 OR y = 2 AND z = 3");
         match stmt.where_.unwrap() {
-            WhereExpr::Or(left, right) => {
-                assert!(matches!(*left, WhereExpr::BinaryOp { .. }));
-                assert!(matches!(*right, WhereExpr::And(_, _)));
+            WhereExpr::Or(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], WhereExpr::BinaryOp { .. }));
+                assert!(matches!(items[1], WhereExpr::And(_)));
             }
-            other => panic!("expected Or(_, And(_, _)), got {other:?}"),
+            other => panic!("expected Or([_, And(_)]), got {other:?}"),
         }
     }
 
@@ -773,10 +767,11 @@ mod tests {
     fn where_parenthesized() {
         let stmt = parse_ok("SELECT * FROM user WHERE (age > 18 OR age < 5) AND active = true");
         match stmt.where_.unwrap() {
-            WhereExpr::And(left, _) => {
-                assert!(matches!(*left, WhereExpr::Or(_, _)));
+            WhereExpr::And(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], WhereExpr::Or(_)));
             }
-            other => panic!("expected And(Or(..), ..), got {other:?}"),
+            other => panic!("expected And([Or(..), ..]), got {other:?}"),
         }
     }
 
@@ -785,7 +780,7 @@ mod tests {
         // && and || are the symbol alternatives for AND / OR
         let stmt = parse_ok("SELECT * FROM user WHERE age > 18 && active = true || name = 'admin'");
         // (age > 18 AND active = true) OR name = 'admin'
-        assert!(matches!(stmt.where_.unwrap(), WhereExpr::Or(_, _)));
+        assert!(matches!(stmt.where_.unwrap(), WhereExpr::Or(_)));
     }
 
     // ── Column vs column ────────────────────────────────────────────────
@@ -829,7 +824,7 @@ mod tests {
     #[test]
     fn where_case_insensitive() {
         let stmt = parse_ok("select * from users where age > 18 and active = true");
-        assert!(matches!(stmt.where_.unwrap(), WhereExpr::And(_, _)));
+        assert!(matches!(stmt.where_.unwrap(), WhereExpr::And(_)));
     }
 
     // ── Subquery in SELECT field with WHERE ─────────────────────────────

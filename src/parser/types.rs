@@ -21,10 +21,10 @@ pub enum WhereExpr {
         left: WhereOperand,
         right: WhereOperand,
     },
-    /// `left AND right`
-    And(Box<WhereExpr>, Box<WhereExpr>),
-    /// `left OR right`
-    Or(Box<WhereExpr>, Box<WhereExpr>),
+    /// `a AND b AND c …` — flat list, all must hold
+    And(Vec<WhereExpr>),
+    /// `a OR b OR c …` — flat list, any must hold
+    Or(Vec<WhereExpr>),
     /// `NOT expr`  or  `!expr`
     Not(Box<WhereExpr>),
 }
